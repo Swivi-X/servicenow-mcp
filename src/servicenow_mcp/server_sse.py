@@ -1,30 +1,36 @@
 """
-ServiceNow MCP Server — SSE (HTTP) transport with OAuth 2.0 client credentials auth.
+ServiceNow MCP Server — SSE (HTTP) transport with OAuth 2.0 authorization_code + PKCE.
 
 Endpoints:
-  GET  /health                                — unauthenticated health check
-  GET  /.well-known/oauth-authorization-server — OAuth 2.0 metadata discovery
-  POST /token                                 — OAuth 2.0 client_credentials token exchange
-  GET  /sse                                   — authenticated SSE stream  (Bearer token)
-  POST /messages/                             — authenticated message post (Bearer token)
+  GET  /health                                    — unauthenticated health check
+  GET  /.well-known/oauth-protected-resource      — RFC 9470 protected resource metadata
+  GET  /.well-known/oauth-authorization-server    — RFC 8414 authorization server metadata
+  GET  /authorize                                 — OAuth 2.0 authorization (auto-approves valid clients)
+  POST /token                                     — OAuth 2.0 token exchange (auth code + PKCE)
+  GET  /sse                                       — authenticated SSE stream  (Bearer token)
+  POST /messages/                                 — authenticated message post (Bearer token)
 
-Auth flow for Claude Desktop "Add custom connector":
-  1. Claude reads /.well-known/oauth-authorization-server to find the token endpoint
-  2. Claude POSTs client_id + client_secret to /token
-  3. Server validates credentials and returns an access_token
-  4. Claude uses the access_token as Bearer token for /sse and /messages/
+Auth flow for Cowork "Add custom connector":
+  1. Cowork POSTs to /sse → gets 401
+  2. Cowork reads /.well-known/oauth-protected-resource to find the auth server
+  3. Cowork reads /.well-known/oauth-authorization-server to find authorize + token endpoints
+  4. Cowork redirects to /authorize with code_challenge (PKCE S256)
+  5. Server validates client_id, stores code_challenge, returns auth code via redirect
+  6. Cowork POSTs to /token with auth code + code_verifier
+  7. Server validates PKCE, returns access_token
+  8. Cowork uses access_token as Bearer token for /sse and /messages/
 """
 
 import argparse
+import base64
 import hashlib
-import hmac
 import json
 import logging
 import os
 import secrets
 import time
 from typing import Dict, Optional, Union
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import uvicorn
 from dotenv import load_dotenv
@@ -34,7 +40,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
 
 from servicenow_mcp.server import ServiceNowMCP
@@ -58,10 +64,9 @@ async def handle_health(request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
-# OAuth 2.0 discovery + token endpoint
+# OAuth 2.0 configuration (set at startup)
 # ---------------------------------------------------------------------------
 
-# Will be set at startup from env vars
 _oauth_config: Dict[str, Optional[str]] = {
     "client_id": None,
     "client_secret": None,
@@ -69,105 +74,297 @@ _oauth_config: Dict[str, Optional[str]] = {
     "issuer_url": None,
 }
 
+# In-memory store for pending authorization codes
+# Maps: auth_code -> {"code_challenge": str, "redirect_uri": str, "client_id": str, "expires": float}
+_pending_codes: Dict[str, dict] = {}
 
-def _generate_access_token(auth_token: str) -> str:
-    """Generate a deterministic access token derived from the MCP_AUTH_TOKEN.
-
-    This way the Bearer middleware can validate it without storing extra state.
-    We simply use the auth_token itself as the access token.
-    """
-    return auth_token
+# Cleanup codes older than 10 minutes
+_CODE_LIFETIME = 600
 
 
-async def handle_oauth_metadata(request: Request) -> Response:
-    """RFC 8414 — OAuth 2.0 Authorization Server Metadata."""
-    issuer = _oauth_config["issuer_url"] or str(request.base_url).rstrip("/")
+def _cleanup_expired_codes():
+    """Remove expired authorization codes."""
+    now = time.time()
+    expired = [code for code, data in _pending_codes.items() if data["expires"] < now]
+    for code in expired:
+        del _pending_codes[code]
+
+
+def _get_issuer(request: Request) -> str:
+    """Get the issuer URL from config or request."""
+    return _oauth_config["issuer_url"] or str(request.base_url).rstrip("/")
+
+
+# ---------------------------------------------------------------------------
+# RFC 9470 — Protected Resource Metadata
+# ---------------------------------------------------------------------------
+
+async def handle_protected_resource(request: Request) -> Response:
+    """Tell the client where to find our authorization server."""
+    issuer = _get_issuer(request)
     return JSONResponse({
-        "issuer": issuer,
-        "token_endpoint": f"{issuer}/token",
-        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
-        "grant_types_supported": ["client_credentials"],
-        "response_types_supported": [],
-        "scopes_supported": ["mcp:tools"],
+        "resource": issuer,
+        "authorization_servers": [issuer],
     })
 
 
+# Also handle the path-suffixed variant that Cowork tries first
+async def handle_protected_resource_sse(request: Request) -> Response:
+    """Same as above, for /.well-known/oauth-protected-resource/sse."""
+    return await handle_protected_resource(request)
+
+
+# ---------------------------------------------------------------------------
+# RFC 8414 — OAuth 2.0 Authorization Server Metadata
+# ---------------------------------------------------------------------------
+
+async def handle_oauth_metadata(request: Request) -> Response:
+    """Authorization server metadata discovery."""
+    issuer = _get_issuer(request)
+    return JSONResponse({
+        "issuer": issuer,
+        "authorization_endpoint": f"{issuer}/authorize",
+        "token_endpoint": f"{issuer}/token",
+        "token_endpoint_auth_methods_supported": [
+            "client_secret_post",
+            "client_secret_basic",
+            "none",
+        ],
+        "grant_types_supported": ["authorization_code"],
+        "response_types_supported": ["code"],
+        "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": ["mcp:tools", "claudeai"],
+    })
+
+
+# ---------------------------------------------------------------------------
+# /authorize — Authorization endpoint (auto-approves valid clients)
+# ---------------------------------------------------------------------------
+
+async def handle_authorize(request: Request) -> Response:
+    """OAuth 2.0 authorization endpoint with PKCE support.
+
+    Since this is a machine-to-machine MCP server (not a user-facing app),
+    we auto-approve requests from valid client_ids without showing a consent page.
+    """
+    params = dict(request.query_params)
+
+    response_type = params.get("response_type")
+    client_id = params.get("client_id")
+    redirect_uri = params.get("redirect_uri")
+    code_challenge = params.get("code_challenge")
+    code_challenge_method = params.get("code_challenge_method", "S256")
+    state = params.get("state")
+
+    # Validate required params
+    if response_type != "code":
+        return JSONResponse(
+            {"error": "unsupported_response_type", "error_description": "Only 'code' is supported"},
+            status_code=400,
+        )
+
+    if not client_id:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Missing client_id"},
+            status_code=400,
+        )
+
+    if not redirect_uri:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Missing redirect_uri"},
+            status_code=400,
+        )
+
+    if not code_challenge:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Missing code_challenge (PKCE required)"},
+            status_code=400,
+        )
+
+    if code_challenge_method != "S256":
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Only S256 code_challenge_method supported"},
+            status_code=400,
+        )
+
+    # Validate client_id matches configured one (if configured)
+    configured_client_id = _oauth_config["client_id"]
+    if configured_client_id:
+        if not secrets.compare_digest(client_id, configured_client_id):
+            return JSONResponse(
+                {"error": "invalid_client", "error_description": "Unknown client_id"},
+                status_code=401,
+            )
+
+    # Validate redirect_uri (must be HTTPS or localhost)
+    parsed_redirect = urlparse(redirect_uri)
+    if parsed_redirect.scheme not in ("https", "http"):
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Invalid redirect_uri scheme"},
+            status_code=400,
+        )
+
+    # Clean up expired codes
+    _cleanup_expired_codes()
+
+    # Generate authorization code
+    auth_code = secrets.token_urlsafe(48)
+    _pending_codes[auth_code] = {
+        "code_challenge": code_challenge,
+        "redirect_uri": redirect_uri,
+        "client_id": client_id,
+        "expires": time.time() + _CODE_LIFETIME,
+    }
+
+    # Redirect back to the client with the auth code
+    redirect_params = {"code": auth_code}
+    if state:
+        redirect_params["state"] = state
+
+    separator = "&" if "?" in redirect_uri else "?"
+    redirect_url = f"{redirect_uri}{separator}{urlencode(redirect_params)}"
+
+    logger.info("OAuth: issued authorization code for client_id=%s, redirecting to %s",
+                client_id[:8] + "...", parsed_redirect.netloc)
+
+    return RedirectResponse(url=redirect_url, status_code=302)
+
+
+# ---------------------------------------------------------------------------
+# /token — Token endpoint (authorization_code + PKCE exchange)
+# ---------------------------------------------------------------------------
+
 async def handle_token(request: Request) -> Response:
-    """OAuth 2.0 token endpoint — client_credentials grant only."""
-    client_id = _oauth_config["client_id"]
-    client_secret = _oauth_config["client_secret"]
+    """OAuth 2.0 token endpoint — authorization_code with PKCE."""
     auth_token = _oauth_config["auth_token"]
 
-    # If OAuth is not configured, return an error
-    if not client_id or not client_secret or not auth_token:
+    if not auth_token:
         return JSONResponse(
-            {"error": "server_error", "error_description": "OAuth not configured on server"},
+            {"error": "server_error", "error_description": "OAuth not configured (MCP_AUTH_TOKEN not set)"},
             status_code=500,
         )
 
-    # Parse the request body (application/x-www-form-urlencoded)
+    # Parse form-encoded body
     body = await request.body()
     try:
-        # Try form-encoded first
         params = parse_qs(body.decode("utf-8"))
-        provided_grant = params.get("grant_type", [None])[0]
-        provided_id = params.get("client_id", [None])[0]
-        provided_secret = params.get("client_secret", [None])[0]
     except Exception:
-        # Try JSON body as fallback
-        try:
-            data = json.loads(body)
-            provided_grant = data.get("grant_type")
-            provided_id = data.get("client_id")
-            provided_secret = data.get("client_secret")
-        except Exception:
-            return JSONResponse(
-                {"error": "invalid_request", "error_description": "Could not parse request body"},
-                status_code=400,
-            )
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Could not parse request body"},
+            status_code=400,
+        )
 
-    # Also check Authorization: Basic header (client_secret_basic method)
-    if not provided_id or not provided_secret:
-        import base64
+    grant_type = (params.get("grant_type") or [None])[0]
+    code = (params.get("code") or [None])[0]
+    redirect_uri = (params.get("redirect_uri") or [None])[0]
+    code_verifier = (params.get("code_verifier") or [None])[0]
+    provided_client_id = (params.get("client_id") or [None])[0]
+    provided_client_secret = (params.get("client_secret") or [None])[0]
+
+    # Also support client_secret_basic
+    if not provided_client_id or not provided_client_secret:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Basic "):
             try:
                 decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
-                provided_id, provided_secret = decoded.split(":", 1)
+                provided_client_id, provided_client_secret = decoded.split(":", 1)
             except Exception:
                 pass
 
-    # Validate grant type
-    if provided_grant != "client_credentials":
+    # Support both authorization_code and client_credentials
+    if grant_type == "client_credentials":
+        return await _handle_client_credentials(provided_client_id, provided_client_secret)
+
+    if grant_type != "authorization_code":
         return JSONResponse(
-            {"error": "unsupported_grant_type", "error_description": "Only client_credentials is supported"},
+            {"error": "unsupported_grant_type",
+             "error_description": "Supported: authorization_code, client_credentials"},
             status_code=400,
         )
 
-    # Validate client credentials (constant-time comparison)
-    if not provided_id or not provided_secret:
+    # Validate authorization code
+    if not code:
         return JSONResponse(
-            {"error": "invalid_client", "error_description": "Missing client_id or client_secret"},
-            status_code=401,
-            headers={"WWW-Authenticate": "Basic"},
+            {"error": "invalid_request", "error_description": "Missing authorization code"},
+            status_code=400,
         )
 
-    id_valid = secrets.compare_digest(provided_id, client_id)
-    secret_valid = secrets.compare_digest(provided_secret, client_secret)
+    _cleanup_expired_codes()
 
-    if not id_valid or not secret_valid:
+    pending = _pending_codes.pop(code, None)
+    if not pending:
         return JSONResponse(
-            {"error": "invalid_client", "error_description": "Invalid client credentials"},
-            status_code=401,
-            headers={"WWW-Authenticate": "Basic"},
+            {"error": "invalid_grant", "error_description": "Invalid or expired authorization code"},
+            status_code=400,
+        )
+
+    # Validate redirect_uri matches
+    if redirect_uri and redirect_uri != pending["redirect_uri"]:
+        return JSONResponse(
+            {"error": "invalid_grant", "error_description": "redirect_uri mismatch"},
+            status_code=400,
+        )
+
+    # Validate PKCE code_verifier
+    if not code_verifier:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Missing code_verifier (PKCE required)"},
+            status_code=400,
+        )
+
+    # S256: code_challenge = BASE64URL(SHA256(code_verifier))
+    expected_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+
+    if not secrets.compare_digest(expected_challenge, pending["code_challenge"]):
+        logger.warning("OAuth: PKCE verification failed for client_id=%s", pending["client_id"][:8] + "...")
+        return JSONResponse(
+            {"error": "invalid_grant", "error_description": "PKCE verification failed"},
+            status_code=400,
         )
 
     # Issue access token
-    access_token = _generate_access_token(auth_token)
+    logger.info("OAuth: issued access token for client_id=%s", pending["client_id"][:8] + "...")
     return JSONResponse({
-        "access_token": access_token,
+        "access_token": auth_token,
         "token_type": "bearer",
-        "expires_in": 86400,  # 24 hours (token doesn't actually expire, but spec requires it)
+        "expires_in": 86400,
+        "scope": "mcp:tools",
+    })
+
+
+async def _handle_client_credentials(client_id: Optional[str], client_secret: Optional[str]) -> Response:
+    """Handle client_credentials grant (for non-Cowork clients)."""
+    configured_id = _oauth_config["client_id"]
+    configured_secret = _oauth_config["client_secret"]
+    auth_token = _oauth_config["auth_token"]
+
+    if not configured_id or not configured_secret or not auth_token:
+        return JSONResponse(
+            {"error": "server_error", "error_description": "OAuth client_credentials not configured"},
+            status_code=500,
+        )
+
+    if not client_id or not client_secret:
+        return JSONResponse(
+            {"error": "invalid_client", "error_description": "Missing client_id or client_secret"},
+            status_code=401,
+        )
+
+    if not (secrets.compare_digest(client_id, configured_id) and
+            secrets.compare_digest(client_secret, configured_secret)):
+        return JSONResponse(
+            {"error": "invalid_client", "error_description": "Invalid client credentials"},
+            status_code=401,
+        )
+
+    return JSONResponse({
+        "access_token": auth_token,
+        "token_type": "bearer",
+        "expires_in": 86400,
         "scope": "mcp:tools",
     })
 
@@ -176,8 +373,15 @@ async def handle_token(request: Request) -> Response:
 # Bearer-token authentication middleware
 # ---------------------------------------------------------------------------
 
-# Paths that are allowed without authentication
-_PUBLIC_PATHS = frozenset({"/health", "/.well-known/oauth-authorization-server", "/token"})
+# Paths/prefixes allowed without authentication
+_PUBLIC_PATHS = frozenset({
+    "/health",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/sse",
+    "/authorize",
+    "/token",
+})
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -198,6 +402,10 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Allow public endpoints through without auth
         if request.url.path in _PUBLIC_PATHS:
+            return await call_next(request)
+
+        # Handle OPTIONS preflight requests
+        if request.method == "OPTIONS":
             return await call_next(request)
 
         # If no token configured, skip auth (local dev mode)
@@ -269,7 +477,10 @@ def create_starlette_app(
         debug=debug,
         routes=[
             Route("/health", endpoint=handle_health),
+            Route("/.well-known/oauth-protected-resource/sse", endpoint=handle_protected_resource_sse),
+            Route("/.well-known/oauth-protected-resource", endpoint=handle_protected_resource),
             Route("/.well-known/oauth-authorization-server", endpoint=handle_oauth_metadata),
+            Route("/authorize", endpoint=handle_authorize),
             Route("/token", endpoint=handle_token, methods=["POST"]),
             Route("/sse", endpoint=handle_sse),
             Mount("/messages/", app=sse.handle_post_message),
@@ -381,12 +592,15 @@ def main():
 
     if mcp_auth_token:
         logger.info("Bearer token authentication ENABLED for MCP clients")
-        if mcp_client_id and mcp_client_secret:
-            logger.info("OAuth 2.0 client_credentials flow ENABLED (token endpoint at /token)")
+        if mcp_client_id:
+            logger.info("OAuth 2.0 authorization_code + PKCE flow ENABLED")
+            logger.info("  Discovery: /.well-known/oauth-authorization-server")
+            logger.info("  Authorize: /authorize")
+            logger.info("  Token:     /token")
         else:
             logger.warning(
-                "MCP_CLIENT_ID / MCP_CLIENT_SECRET not set — "
-                "OAuth token endpoint disabled. Clients must provide Bearer token directly."
+                "MCP_CLIENT_ID not set — OAuth auto-approve disabled. "
+                "Any client_id will be accepted for authorization."
             )
     else:
         logger.warning(
