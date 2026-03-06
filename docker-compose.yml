@@ -36,9 +36,10 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: cloudflared
     restart: unless-stopped
-    command: tunnel run
-    environment:
-      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    entrypoint: []
+    command: sh -c "cloudflared tunnel --no-autoupdate run --token $$TUNNEL_TOKEN"
+    env_file:
+      - .env.tunnel
     networks:
       - mcp-internal
     depends_on:

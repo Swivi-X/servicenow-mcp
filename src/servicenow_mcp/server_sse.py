@@ -1,17 +1,30 @@
 """
-ServiceNow MCP Server — SSE (HTTP) transport with Bearer token authentication.
+ServiceNow MCP Server — SSE (HTTP) transport with OAuth 2.0 client credentials auth.
 
 Endpoints:
-  GET  /health     — unauthenticated health check (for Docker/LB probes)
-  GET  /sse        — authenticated SSE stream  (requires Authorization: Bearer <token>)
-  POST /messages/  — authenticated message post (requires Authorization: Bearer <token>)
+  GET  /health                                — unauthenticated health check
+  GET  /.well-known/oauth-authorization-server — OAuth 2.0 metadata discovery
+  POST /token                                 — OAuth 2.0 client_credentials token exchange
+  GET  /sse                                   — authenticated SSE stream  (Bearer token)
+  POST /messages/                             — authenticated message post (Bearer token)
+
+Auth flow for Claude Desktop "Add custom connector":
+  1. Claude reads /.well-known/oauth-authorization-server to find the token endpoint
+  2. Claude POSTs client_id + client_secret to /token
+  3. Server validates credentials and returns an access_token
+  4. Claude uses the access_token as Bearer token for /sse and /messages/
 """
 
 import argparse
+import hashlib
+import hmac
+import json
 import logging
 import os
 import secrets
+import time
 from typing import Dict, Optional, Union
+from urllib.parse import parse_qs
 
 import uvicorn
 from dotenv import load_dotenv
@@ -45,11 +58,126 @@ async def handle_health(request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# OAuth 2.0 discovery + token endpoint
+# ---------------------------------------------------------------------------
+
+# Will be set at startup from env vars
+_oauth_config: Dict[str, Optional[str]] = {
+    "client_id": None,
+    "client_secret": None,
+    "auth_token": None,
+    "issuer_url": None,
+}
+
+
+def _generate_access_token(auth_token: str) -> str:
+    """Generate a deterministic access token derived from the MCP_AUTH_TOKEN.
+
+    This way the Bearer middleware can validate it without storing extra state.
+    We simply use the auth_token itself as the access token.
+    """
+    return auth_token
+
+
+async def handle_oauth_metadata(request: Request) -> Response:
+    """RFC 8414 — OAuth 2.0 Authorization Server Metadata."""
+    issuer = _oauth_config["issuer_url"] or str(request.base_url).rstrip("/")
+    return JSONResponse({
+        "issuer": issuer,
+        "token_endpoint": f"{issuer}/token",
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+        "grant_types_supported": ["client_credentials"],
+        "response_types_supported": [],
+        "scopes_supported": ["mcp:tools"],
+    })
+
+
+async def handle_token(request: Request) -> Response:
+    """OAuth 2.0 token endpoint — client_credentials grant only."""
+    client_id = _oauth_config["client_id"]
+    client_secret = _oauth_config["client_secret"]
+    auth_token = _oauth_config["auth_token"]
+
+    # If OAuth is not configured, return an error
+    if not client_id or not client_secret or not auth_token:
+        return JSONResponse(
+            {"error": "server_error", "error_description": "OAuth not configured on server"},
+            status_code=500,
+        )
+
+    # Parse the request body (application/x-www-form-urlencoded)
+    body = await request.body()
+    try:
+        # Try form-encoded first
+        params = parse_qs(body.decode("utf-8"))
+        provided_grant = params.get("grant_type", [None])[0]
+        provided_id = params.get("client_id", [None])[0]
+        provided_secret = params.get("client_secret", [None])[0]
+    except Exception:
+        # Try JSON body as fallback
+        try:
+            data = json.loads(body)
+            provided_grant = data.get("grant_type")
+            provided_id = data.get("client_id")
+            provided_secret = data.get("client_secret")
+        except Exception:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "Could not parse request body"},
+                status_code=400,
+            )
+
+    # Also check Authorization: Basic header (client_secret_basic method)
+    if not provided_id or not provided_secret:
+        import base64
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+                provided_id, provided_secret = decoded.split(":", 1)
+            except Exception:
+                pass
+
+    # Validate grant type
+    if provided_grant != "client_credentials":
+        return JSONResponse(
+            {"error": "unsupported_grant_type", "error_description": "Only client_credentials is supported"},
+            status_code=400,
+        )
+
+    # Validate client credentials (constant-time comparison)
+    if not provided_id or not provided_secret:
+        return JSONResponse(
+            {"error": "invalid_client", "error_description": "Missing client_id or client_secret"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    id_valid = secrets.compare_digest(provided_id, client_id)
+    secret_valid = secrets.compare_digest(provided_secret, client_secret)
+
+    if not id_valid or not secret_valid:
+        return JSONResponse(
+            {"error": "invalid_client", "error_description": "Invalid client credentials"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    # Issue access token
+    access_token = _generate_access_token(auth_token)
+    return JSONResponse({
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": 86400,  # 24 hours (token doesn't actually expire, but spec requires it)
+        "scope": "mcp:tools",
+    })
+
+
+# ---------------------------------------------------------------------------
 # Bearer-token authentication middleware
 # ---------------------------------------------------------------------------
 
 # Paths that are allowed without authentication
-_PUBLIC_PATHS = frozenset({"/health"})
+_PUBLIC_PATHS = frozenset({"/health", "/.well-known/oauth-authorization-server", "/token"})
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -141,6 +269,8 @@ def create_starlette_app(
         debug=debug,
         routes=[
             Route("/health", endpoint=handle_health),
+            Route("/.well-known/oauth-authorization-server", endpoint=handle_oauth_metadata),
+            Route("/token", endpoint=handle_token, methods=["POST"]),
             Route("/sse", endpoint=handle_sse),
             Mount("/messages/", app=sse.handle_post_message),
         ],
@@ -239,15 +369,26 @@ def main():
     mcp_auth_token = os.getenv("MCP_AUTH_TOKEN")
     debug_mode = os.getenv("SERVICENOW_DEBUG", "false").lower() == "true"
 
+    # --- Configure OAuth 2.0 for MCP clients ---
+    mcp_client_id = os.getenv("MCP_CLIENT_ID")
+    mcp_client_secret = os.getenv("MCP_CLIENT_SECRET")
+    mcp_issuer_url = os.getenv("MCP_ISSUER_URL")
+
+    _oauth_config["client_id"] = mcp_client_id
+    _oauth_config["client_secret"] = mcp_client_secret
+    _oauth_config["auth_token"] = mcp_auth_token
+    _oauth_config["issuer_url"] = mcp_issuer_url
+
     if mcp_auth_token:
         logger.info("Bearer token authentication ENABLED for MCP clients")
-    else:
-        # If a Cloudflare tunnel token is set, we're likely in production — refuse to start without auth
-        if os.getenv("CLOUDFLARE_TUNNEL_TOKEN"):
-            raise SystemExit(
-                "FATAL: MCP_AUTH_TOKEN is required when CLOUDFLARE_TUNNEL_TOKEN is set. "
-                "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+        if mcp_client_id and mcp_client_secret:
+            logger.info("OAuth 2.0 client_credentials flow ENABLED (token endpoint at /token)")
+        else:
+            logger.warning(
+                "MCP_CLIENT_ID / MCP_CLIENT_SECRET not set — "
+                "OAuth token endpoint disabled. Clients must provide Bearer token directly."
             )
+    else:
         logger.warning(
             "MCP_AUTH_TOKEN not set — SSE server is UNAUTHENTICATED. "
             "Set MCP_AUTH_TOKEN for production deployments."

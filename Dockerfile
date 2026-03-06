@@ -35,7 +35,8 @@ COPY config/ /app/config/
 # Make sure the venv binaries are on PATH
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    TOOL_PACKAGE_CONFIG_PATH=/app/config/tool_packages.yaml
 
 WORKDIR /app
 
