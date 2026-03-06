@@ -170,23 +170,21 @@ def create_config(args) -> ServerConfig:
         password = args.password or os.getenv("SERVICENOW_PASSWORD")  # Needed for password grant
         token_url = args.token_url or os.getenv("SERVICENOW_TOKEN_URL")
 
-        if not client_id or not client_secret or not username or not password:
+        if not client_id or not client_secret:
             raise ValueError(
-                "Client ID, client secret, username, and password are required for OAuth password grant"
-                " (--client-id/SERVICENOW_CLIENT_ID, etc.)"
+                "Client ID and client secret are required for OAuth"
+                " (--client-id/SERVICENOW_CLIENT_ID, --client-secret/SERVICENOW_CLIENT_SECRET)"
             )
         if not token_url:
-            # Attempt to construct default if not provided
             token_url = f"{instance_url}/oauth_token.do"
             logger.warning(f"OAuth token URL not provided, defaulting to: {token_url}")
 
-        # Create the specific config (without instance_url)
         oauth_cfg = OAuthConfig(
             client_id=client_id,
             client_secret=client_secret,
+            token_url=token_url,
             username=username,
             password=password,
-            token_url=token_url,
         )
         # Create the main AuthConfig wrapper
         final_auth_config = AuthConfig(type=auth_type, oauth=oauth_cfg)

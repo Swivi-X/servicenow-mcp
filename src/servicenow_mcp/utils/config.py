@@ -28,9 +28,9 @@ class OAuthConfig(BaseModel):
 
     client_id: str
     client_secret: str
-    username: str
-    password: str
     token_url: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
 
 
 class ApiKeyConfig(BaseModel):
