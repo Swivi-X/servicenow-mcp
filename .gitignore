@@ -185,3 +185,17 @@ cython_debug/
 
 # Docker Compose overrides (keep docker-compose.yml in VCS)
 docker-compose.override.yml
+
+# macOS artifacts
+.DS_Store
+
+# Local tool configs
+.cursorrules
+.mcp.json
+
+# Claude Code working directory
+.claude/
+
+# Local deployment docs and binaries
+DEPLOY.md
+*.docx
