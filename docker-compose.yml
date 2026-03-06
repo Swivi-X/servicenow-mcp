@@ -20,6 +20,9 @@ services:
     ports:
       # Expose locally for debugging; Cloudflare Tunnel connects internally
       - "127.0.0.1:8080:8080"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     networks:
       - mcp-internal
     deploy:
@@ -32,14 +35,18 @@ services:
           cpus: "0.25"
 
   # ---- Cloudflare Tunnel sidecar ----
+  # NOTE: cloudflared image is minimal (no sh/bash). Use direct command, not sh -c.
+  # TUNNEL_TOKEN is read from .env.tunnel (create from .env.tunnel.template).
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: cloudflared
     restart: unless-stopped
-    entrypoint: []
-    command: sh -c "cloudflared tunnel --no-autoupdate run --token $$TUNNEL_TOKEN"
+    command: tunnel --no-autoupdate run
     env_file:
       - .env.tunnel
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     networks:
       - mcp-internal
     depends_on:
