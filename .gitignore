@@ -181,3 +181,6 @@ cython_debug/
 .env.development
 .env.test
 .env.production
+
+# Docker Compose overrides (keep docker-compose.yml in VCS)
+docker-compose.override.yml
