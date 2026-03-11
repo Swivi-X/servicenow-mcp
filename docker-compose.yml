@@ -1,4 +1,4 @@
-# docker-compose.yml — ServiceNow MCP Server + Cloudflare Tunnel
+# docker-compose.yml — ServiceNow MCP Server
 #
 # Usage:
 #   1. Copy .env.production.template → .env.production and fill in values
@@ -8,7 +8,6 @@
 #   5. curl -H "Authorization: Bearer <TOKEN>" http://localhost:8080/sse → SSE stream
 
 services:
-  # ---- MCP Server ----
   servicenow-mcp:
     build:
       context: .
@@ -18,13 +17,11 @@ services:
     env_file:
       - .env.production
     ports:
-      # Expose locally for debugging; Cloudflare Tunnel connects internally
-      - "127.0.0.1:8080:8080"
+      # Expose to host so Cloudflare / reverse proxy can reach it
+      - "8080:8080"
     dns:
       - 8.8.8.8
       - 1.1.1.1
-    networks:
-      - mcp-internal
     deploy:
       resources:
         limits:
@@ -33,26 +30,3 @@ services:
         reservations:
           memory: 128M
           cpus: "0.25"
-
-  # ---- Cloudflare Tunnel sidecar ----
-  # NOTE: cloudflared image is minimal (no sh/bash). Use direct command, not sh -c.
-  # TUNNEL_TOKEN is read from .env.tunnel (create from .env.tunnel.template).
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: cloudflared
-    restart: unless-stopped
-    command: tunnel --no-autoupdate run
-    env_file:
-      - .env.tunnel
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
-    networks:
-      - mcp-internal
-    depends_on:
-      servicenow-mcp:
-        condition: service_healthy
-
-networks:
-  mcp-internal:
-    driver: bridge
